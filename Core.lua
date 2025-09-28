@@ -341,7 +341,13 @@ function CleveRoids.ParseSequence(text)
         lastUpdate = 0,
         cond = cond,
         args = args,
-        cmd = "/castsequence"
+        cmd = "/castsequence",
+        -- 技能队列相关字段
+        queueWindow = 0.5,        -- 测试用 1秒 队列窗口
+        canQueue = false,         -- 是否可以排队
+        queueStartTime = 0,       -- 队列窗口开始时间
+        nextQueued = false,       -- 下一个技能是否已排队
+        queuedIndex = 0          -- 已排队的技能索引
     }
     if resetVal then
         for _, rule in ipairs(CleveRoids.Split(resetVal, "/")) do
@@ -548,35 +554,75 @@ end
 
 function CleveRoids.ResetSequence(sequence)
     sequence.index = 1
+    
+    -- 重置队列相关状态
+    sequence.canQueue = false
+    sequence.nextQueued = false
+    sequence.queueStartTime = 0
 end
 
 function CleveRoids.AdvanceSequence(sequence)
+    local oldIndex = sequence.index
     if sequence.index < table.getn(sequence.list) then
         sequence.index = sequence.index + 1
+        if CleveRoids.showSequenceInfo then
+            CleveRoids.Print(string.format("|cFFFF66FFAdvanceSequence|r %d → %d (%d/%d)", 
+                oldIndex, sequence.index, sequence.index, table.getn(sequence.list)))
+        end
     else
         CleveRoids.ResetSequence(sequence)
+        if CleveRoids.showSequenceInfo then
+            CleveRoids.Print(string.format("|cFFFF66FFAdvanceSequence|r %d → 1 (重置循环)", oldIndex))
+        end
+        
+        -- 序列循环重置时，触发动作条图标更新
+        for slot, actions in CleveRoids.Actions do
+            if actions.sequence == sequence then
+                CleveRoids.SendEventForAction(slot, "ACTIONBAR_SLOT_CHANGED", slot)
+                break
+            end
+        end
     end
 end
 
 function CleveRoids.TestAction(cmd, args)
     local msg, conditionals = CleveRoids.GetParsedMsg(args)
 
+    -- 调试输出：解析结果 (已屏蔽，太频繁)
+    -- if CleveRoids.showSequenceInfo then
+    --     CleveRoids.Print(string.format("|cFF888888TestAction|r cmd=%s, args=%s → msg=%s", 
+    --         cmd or "nil", args or "nil", msg or "nil"))
+    -- end
+
     if string.find(msg, "#showtooltip") or conditionals.ignoretooltip == 1 then
+        -- if CleveRoids.showSequenceInfo then
+        --     CleveRoids.Print("|cFF888888TestAction|r → 忽略 #showtooltip")
+        -- end
         return
     end
 
     if not conditionals then
         if not msg then
+            -- if CleveRoids.showSequenceInfo then
+            --     CleveRoids.Print("|cFF888888TestAction|r → 无消息，返回nil")
+            -- end
             return
         else
             -- action is a {macro} or item/spell
-            return CleveRoids.GetMacroNameFromAction(msg) or msg
+            local result = CleveRoids.GetMacroNameFromAction(msg) or msg
+            -- if CleveRoids.showSequenceInfo then
+            --     CleveRoids.Print(string.format("|cFF888888TestAction|r → 无条件，返回: %s", result))
+            -- end
+            return result
         end
     end
 
     local origTarget = conditionals.target
     if cmd == "" or not CleveRoids.dynamicCmds[cmd] then
         -- untestables
+        -- if CleveRoids.showSequenceInfo then
+        --     CleveRoids.Print(string.format("|cFF888888TestAction|r → 不可测试的命令: %s", cmd))
+        -- end
         return
     end
 
@@ -586,6 +632,9 @@ function CleveRoids.TestAction(cmd, args)
         end
         if not conditionals.target or (conditionals.target ~= "focus" and not UnitExists(conditionals.target)) then
             conditionals.target = origTarget
+            -- if CleveRoids.showSequenceInfo then
+            --     CleveRoids.Print("|cFF888888TestAction|r → mouseover 目标无效")
+            -- end
             return false
         end
     end
@@ -593,11 +642,25 @@ function CleveRoids.TestAction(cmd, args)
     CleveRoids.FixEmptyTarget(conditionals)
     CleveRoids.SetHelp(conditionals)
 
+    -- 调试输出：条件测试 (已屏蔽，太频繁)
+    -- if CleveRoids.showSequenceInfo then
+    --     local condStr = ""
+    --     for k, v in pairs(conditionals) do
+    --         if not CleveRoids.ignoreKeywords[k] then
+    --             condStr = condStr .. k .. "=" .. tostring(v) .. " "
+    --         end
+    --     end
+    --     CleveRoids.Print(string.format("|cFF888888TestAction|r → 测试条件: %s", condStr))
+    -- end
+
     for k, v in pairs(conditionals) do
         if not CleveRoids.ignoreKeywords[k] then
             if not CleveRoids.Keywords[k] or not CleveRoids.Keywords[k](conditionals) then
                 -- failed test
                 conditionals.target = origTarget
+                -- if CleveRoids.showSequenceInfo then
+                --     CleveRoids.Print(string.format("|cFF888888TestAction|r → 条件失败: %s", k))
+                -- end
                 return
             end
         end
@@ -605,7 +668,11 @@ function CleveRoids.TestAction(cmd, args)
 
     -- tests passed
     conditionals.target = origTarget
-    return CleveRoids.GetMacroNameFromAction(msg) or msg
+    local result = CleveRoids.GetMacroNameFromAction(msg) or msg
+    -- if CleveRoids.showSequenceInfo then
+    --     CleveRoids.Print(string.format("|cFF888888TestAction|r → 条件通过，返回: %s", result))
+    -- end
+    return result
 end
 
 -- Does the given action with a set of conditionals provided by the given msg
@@ -929,7 +996,34 @@ function CleveRoids.DoCastSequence(sequence)
     if CleveRoids.currentSequence and not CleveRoids.CheckSpellCast("player") then
         CleveRoids.currentSequence = nil
     elseif CleveRoids.currentSequence then
-        return
+        -- 智能队列检查：如果是同一个序列且在队列窗口期内，允许排队
+        if sequence == CleveRoids.currentSequence and CleveRoids.currentSequence.canQueue then
+            -- 检查是否已经排队了下一个技能
+            if not CleveRoids.currentSequence.nextQueued then
+                -- 推进序列索引，标记为已排队
+                CleveRoids.AdvanceSequence(CleveRoids.currentSequence)
+                CleveRoids.currentSequence.nextQueued = true
+                CleveRoids.currentSequence.queuedIndex = CleveRoids.currentSequence.index
+                
+                CleveRoids.LogWithTime(string.format("|cFF00FF00排队|r 下一个技能 (索引: %d/%d)", 
+                    CleveRoids.currentSequence.index, table.getn(CleveRoids.currentSequence.list)))
+                
+                -- 触发动作条图标更新
+                for slot, actions in CleveRoids.Actions do
+                    if actions == sequence then
+                        CleveRoids.SendEventForAction(slot, "ACTIONBAR_SLOT_CHANGED", slot)
+                        break
+                    end
+                end
+                return
+            else
+                CleveRoids.LogWithTime("|cFFFFAA00已排队|r - 忽略重复按键")
+                return
+            end
+        else
+            CleveRoids.LogWithTime("|cFFFF0000阻止|r - 不在队列窗口期或序列不匹配")
+            return
+        end
     end
 
     if sequence.index > 1 then
@@ -937,6 +1031,14 @@ function CleveRoids.DoCastSequence(sequence)
             for k, _ in sequence.reset do
                 if CleveRoids.kmods[k] and CleveRoids.kmods[k]() then
                     CleveRoids.ResetSequence(sequence)
+                    
+                    -- 触发动作条图标更新
+                    for slot, actions in CleveRoids.Actions do
+                        if actions.sequence == sequence then
+                            CleveRoids.SendEventForAction(slot, "ACTIONBAR_SLOT_CHANGED", slot)
+                            break
+                        end
+                    end
                 end
             end
         end
@@ -974,9 +1076,46 @@ function CleveRoids.OnUpdate(self)
 
     for _, sequence in pairs(CleveRoids.Sequences) do
         if sequence.index > 1 and sequence.reset.secs and (time - sequence.lastUpdate) >= sequence.reset.secs then
+            if CleveRoids.showSequenceInfo then
+                CleveRoids.Print(string.format("|cFFAA66FF超时重置|r 序列: %s (超时 %.1fs)", 
+                    sequence.args, sequence.reset.secs))
+            end
             CleveRoids.ResetSequence(sequence)
+            
+            -- 触发动作条图标更新，显示重置后的第一个技能
+            for slot, actions in CleveRoids.Actions do
+                if actions.sequence == sequence then
+                    CleveRoids.SendEventForAction(slot, "ACTIONBAR_SLOT_CHANGED", slot)
+                    break
+                end
+            end
         end
+        
+        -- 检查队列窗口状态
+        if sequence.queueStartTime > 0 and not sequence.canQueue and time >= sequence.queueStartTime then
+            sequence.canQueue = true
+            if CleveRoids.showSequenceInfo then
+                CleveRoids.LogWithTime(string.format("|cFF00AAFF队列窗口开启|r - 可以排队下一个技能 (剩余 %.1fs)", 
+                    sequence.queueWindow - (time - sequence.queueStartTime)))
+            end
+            
+            -- 触发动作条图标更新，显示下一个技能
+            for slot, actions in CleveRoids.Actions do
+                if actions.sequence == sequence then
+                    CleveRoids.SendEventForAction(slot, "ACTIONBAR_SLOT_CHANGED", slot)
+                    break
+                end
+            end
+        end
+        
+        local oldActive = sequence.active
         sequence.active = CleveRoids.TestAction(sequence.cmd, sequence.args)
+        
+        -- 只在状态变化时输出，避免刷屏
+        if CleveRoids.showSequenceInfo and oldActive ~= sequence.active then
+            CleveRoids.Print(string.format("|cFFAA66FFOnUpdate|r 序列状态变化: %s → active=%s (索引 %d/%d)", 
+                sequence.args, tostring(sequence.active), sequence.index, table.getn(sequence.list)))
+        end
     end
 
     for guid,cast in CleveRoids.spell_tracking do
@@ -1075,6 +1214,23 @@ function GetActionTexture(slot)
     local actions = CleveRoids.GetAction(slot)
 
     if actions and (actions.active or actions.tooltip) then
+        -- 队列模式：如果是castsequence且在队列窗口期，显示下一个技能的图标
+        if actions.sequence and actions.sequence.canQueue and not actions.sequence.nextQueued then
+            local nextIndex = actions.sequence.index + 1
+            if nextIndex <= table.getn(actions.sequence.list) then
+                local nextAction = actions.sequence.list[nextIndex]
+                if nextAction and nextAction.texture then
+                    return nextAction.texture
+                end
+            else
+                -- 序列即将重置，显示第一个技能
+                local firstAction = actions.sequence.list[1]
+                if firstAction and firstAction.texture then
+                    return firstAction.texture
+                end
+            end
+        end
+        
         local proxySlot = (actions.active and actions.active.spell) and CleveRoids.GetProxyActionSlot(actions.active.spell.name)
         if proxySlot and CleveRoids.Hooks.GetActionTexture(proxySlot) ~= actions.active.spell.texture then
             return CleveRoids.Hooks.GetActionTexture(proxySlot)
@@ -1187,7 +1343,10 @@ function CleveRoids.Frame:PLAYER_LOGIN()
     CleveRoids.IndexItems()
     CleveRoids.IndexActionBars()
     CleveRoids.ready = true
+    CleveRoids.showSequenceInfo = false  -- 默认关闭日志输出
+    CleveRoids.sequenceLogStartTime = GetTime() -- 记录开始时间
     CleveRoids.Print("|cFF4477FFCleveR|r|cFFFFFFFFoid Macros|r |cFF00FF00Loaded|r - See the README.")
+    CleveRoids.Print("castsequence 队列功能已启用，使用 |cFFFFFF00/seqshow on|r 开启调试日志")
 end
 
 function CleveRoids.Frame:ADDON_LOADED(addon)
@@ -1253,20 +1412,61 @@ function CleveRoids.Frame:UNIT_CASTEVENT(caster,target,action,spell_id,cast_time
 
         local name, rank = SpellInfo(spell_id)
         local isSeqSpell = (active.action == name or active.action == (name.."("..rank..")"))
-        if isSeqSpell then
+        
+        
+        -- 对于 FAIL/INTERRUPTED，即使技能名不匹配也要处理，因为可能是当前序列的技能
+        local shouldHandle = isSeqSpell or (action == "FAIL" or action == "INTERRUPTED")
+        
+        if shouldHandle then
             local status = CleveRoids.currentSequence.status
+            local currentTime = GetTime()
+            
             if status == 0 and (action == "START" or action == "CHANNEL") and cast_time > 0 then
                 CleveRoids.currentSequence.status = 1
-                CleveRoids.currentSequence.expires = GetTime() + cast_time - 2000
+                CleveRoids.currentSequence.expires = currentTime + cast_time/1000
+                
+                -- 计算队列窗口：在技能即将完成前开始队列窗口
+                CleveRoids.currentSequence.queueStartTime = currentTime + (cast_time/1000) - CleveRoids.currentSequence.queueWindow
+                CleveRoids.currentSequence.canQueue = false  -- 初始不能排队
+                CleveRoids.currentSequence.nextQueued = false  -- 重置排队状态
+                
+                CleveRoids.LogWithTime(string.format("|cFF66CCFF开始施法|r %s - 持续 %.1fs, 队列窗口将在 %.1fs 后开启", 
+                    name, cast_time/1000, (cast_time/1000) - CleveRoids.currentSequence.queueWindow))
+                    
             elseif (status == 0 and action == "CAST" and cast_time == 0)
                 or (status == 1 and action == "CAST" and CleveRoids.currentSequence.expires)
             then
                 CleveRoids.currentSequence.status = 2
-                CleveRoids.currentSequence.lastUpdate = GetTime()
-                CleveRoids.AdvanceSequence(CleveRoids.currentSequence)
+                CleveRoids.currentSequence.lastUpdate = currentTime
+                
+                -- 如果技能已排队，检查是否是预期的技能
+                if CleveRoids.currentSequence.nextQueued then
+                    CleveRoids.LogWithTime(string.format("|cFF00FF00技能完成|r %s - 已排队的下一个技能生效", name))
+                    -- 重置排队状态，为下一轮准备
+                    CleveRoids.currentSequence.nextQueued = false
+                    CleveRoids.currentSequence.canQueue = false
+                    CleveRoids.currentSequence.queueStartTime = 0
+                else
+                    CleveRoids.LogWithTime(string.format("|cFF00CCAA技能完成|r %s - 推进序列", name))
+                    CleveRoids.AdvanceSequence(CleveRoids.currentSequence)
+                end
+                
                 CleveRoids.currentSequence = nil
-            elseif action == "INTERRUPTED" or action == "FAILED" then
-                CleveRoids.currentSequence.status = 1
+                
+            elseif action == "INTERRUPTED" or action == "FAIL" then
+                -- 技能被打断或失败，重置整个序列
+                CleveRoids.LogWithTime(string.format("|cFFFF3333技能%s|r %s - 重置序列", 
+                    action == "INTERRUPTED" and "被打断" or "失败", name or "unknown"))
+                
+                CleveRoids.ResetSequence(CleveRoids.currentSequence)
+                CleveRoids.currentSequence = nil
+                
+                -- 触发动作条图标更新
+                for slot, actions in CleveRoids.Actions do
+                    if actions.sequence then
+                        CleveRoids.SendEventForAction(slot, "ACTIONBAR_SLOT_CHANGED", slot)
+                    end
+                end
             end
         end
     end
@@ -1292,6 +1492,14 @@ function CleveRoids.Frame:PLAYER_LEAVE_COMBAT()
     for _, sequence in pairs(CleveRoids.Sequences) do
         if CleveRoids.currentSequence ~= sequence and sequence.index > 1 and sequence.reset.combat then
             CleveRoids.ResetSequence(sequence)
+            
+            -- 触发动作条图标更新
+            for slot, actions in CleveRoids.Actions do
+                if actions.sequence == sequence then
+                    CleveRoids.SendEventForAction(slot, "ACTIONBAR_SLOT_CHANGED", slot)
+                    break
+                end
+            end
         end
     end
 end
@@ -1304,6 +1512,14 @@ function CleveRoids.Frame:PLAYER_TARGET_CHANGED()
     for _, sequence in pairs(CleveRoids.Sequences) do
         if CleveRoids.currentSequence ~= sequence and sequence.index > 1 and sequence.reset.target then
             CleveRoids.ResetSequence(sequence)
+            
+            -- 触发动作条图标更新
+            for slot, actions in CleveRoids.Actions do
+                if actions.sequence == sequence then
+                    CleveRoids.SendEventForAction(slot, "ACTIONBAR_SLOT_CHANGED", slot)
+                    break
+                end
+            end
         end
     end
 end
